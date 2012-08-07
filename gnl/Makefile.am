@@ -17,7 +17,9 @@ libgnl_la_SOURCES =		\
 libgnl_la_CFLAGS = $(GST_CFLAGS)
 libgnl_la_LIBADD = $(GST_LIBS)
 libgnl_la_LDFLAGS = $(GST_PLUGIN_LDFLAGS)
+if !GST_PLUGIN_BUILD_STATIC
 libgnl_la_LIBTOOLFLAGS = --tag=disable-static
+endif
 
 gnl_headers =			\
 	gnl.h			\
