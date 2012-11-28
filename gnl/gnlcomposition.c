@@ -616,11 +616,21 @@ gnl_composition_reset (GnlComposition * comp)
 static gboolean
 eos_main_thread (GnlComposition * comp)
 {
+  gboolean reverse = (comp->priv->segment->rate < 0.0);
+
   /* Set up a non-initial seek on segment_stop */
-  GST_DEBUG_OBJECT (comp,
-      "Setting segment->start to segment_stop:%" GST_TIME_FORMAT,
-      GST_TIME_ARGS (comp->priv->segment_stop));
-  comp->priv->segment->start = comp->priv->segment_stop;
+
+  if (!reverse) {
+    GST_DEBUG_OBJECT (comp,
+        "Setting segment->start to segment_stop:%" GST_TIME_FORMAT,
+        GST_TIME_ARGS (comp->priv->segment_stop));
+    comp->priv->segment->start = comp->priv->segment_stop;
+  } else {
+    GST_DEBUG_OBJECT (comp,
+        "Setting segment->stop to segment_start:%" GST_TIME_FORMAT,
+        GST_TIME_ARGS (comp->priv->segment_start));
+    comp->priv->segment->stop = comp->priv->segment_start;
+  }
 
   seek_handling (comp, TRUE, TRUE);
 
@@ -774,6 +784,7 @@ have_to_update_pipeline (GnlComposition * comp)
     return TRUE;
   if (comp->priv->segment->start >= comp->priv->segment_stop)
     return TRUE;
+
   return FALSE;
 }
 
@@ -852,10 +863,11 @@ get_new_seek_event (GnlComposition * comp, gboolean initial,
 
   GST_DEBUG_OBJECT (comp,
       "Created new seek event. Flags:%d, start:%" GST_TIME_FORMAT ", stop:%"
-      GST_TIME_FORMAT, flags, GST_TIME_ARGS (start), GST_TIME_ARGS (stop));
+      GST_TIME_FORMAT ", rate:%lf", flags, GST_TIME_ARGS (start),
+      GST_TIME_ARGS (stop), comp->priv->segment->rate);
   return gst_event_new_seek (comp->priv->segment->rate,
-      comp->priv->segment->format, flags, starttype, start,
-      GST_SEEK_TYPE_SET, stop);
+      comp->priv->segment->format, flags, starttype, start, GST_SEEK_TYPE_SET,
+      stop);
 }
 
 /* OBJECTS LOCK must be taken when calling this ! */
@@ -934,7 +946,11 @@ seek_handling (GnlComposition * comp, gboolean initial, gboolean update)
   COMP_FLUSHING_UNLOCK (comp);
 
   if (update || have_to_update_pipeline (comp)) {
-    update_pipeline (comp, comp->priv->segment->start, initial, TRUE, !update);
+    if (comp->priv->segment->rate >= 0.0)
+      update_pipeline (comp, comp->priv->segment->start, initial, TRUE,
+          !update);
+    else
+      update_pipeline (comp, comp->priv->segment->stop, initial, TRUE, !update);
   }
 
   return TRUE;
@@ -1008,9 +1024,12 @@ gnl_composition_event_handler (GstPad * ghostpad, GstEvent * event)
 
       GST_INFO_OBJECT (comp,
           "timestamp:%" GST_TIME_FORMAT " segment.start:%" GST_TIME_FORMAT
-          " segment_start%" GST_TIME_FORMAT, GST_TIME_ARGS (timestamp),
+          " segment.stop:%" GST_TIME_FORMAT " segment_start:%" GST_TIME_FORMAT
+          " segment_stop:%" GST_TIME_FORMAT, GST_TIME_ARGS (timestamp),
           GST_TIME_ARGS (comp->priv->outside_segment->start),
-          GST_TIME_ARGS (comp->priv->segment_start));
+          GST_TIME_ARGS (comp->priv->outside_segment->stop),
+          GST_TIME_ARGS (comp->priv->segment_start),
+          GST_TIME_ARGS (comp->priv->segment_stop));
 
       /* The problem with QoS events is the following:
        * At each new internal segment (i.e. when we re-arrange our internal
@@ -1043,8 +1062,12 @@ gnl_composition_event_handler (GstPad * ghostpad, GstEvent * event)
         /* We'll either create a new event or discard it */
         gst_event_unref (event);
 
-        curdiff =
-            comp->priv->segment_start - comp->priv->outside_segment->start;
+        if (comp->priv->segment->rate < 0.0)
+          curdiff =
+              comp->priv->outside_segment->stop - comp->priv->segment_stop;
+        else
+          curdiff =
+              comp->priv->segment_start - comp->priv->outside_segment->start;
         GST_DEBUG ("curdiff %" GST_TIME_FORMAT, GST_TIME_ARGS (curdiff));
         if ((curdiff != 0) && ((timestamp < curdiff)
                 || (curdiff > timestamp + diff))) {
@@ -1337,42 +1360,71 @@ get_stack_list (GnlComposition * comp, GstClockTime timestamp,
     guint32 priority, gboolean activeonly, GstClockTime * start,
     GstClockTime * stop, guint * highprio)
 {
-  GList *tmp = comp->priv->objects_start;
+  GList *tmp;
   GList *stack = NULL;
   GNode *ret = NULL;
   GstClockTime nstart = GST_CLOCK_TIME_NONE;
   GstClockTime nstop = GST_CLOCK_TIME_NONE;
   GstClockTime first_out_of_stack = GST_CLOCK_TIME_NONE;
   guint32 highest = 0;
+  gboolean reverse = (comp->priv->segment->rate < 0.0);
 
   GST_DEBUG_OBJECT (comp,
       "timestamp:%" GST_TIME_FORMAT ", priority:%u, activeonly:%d",
       GST_TIME_ARGS (timestamp), priority, activeonly);
 
-  GST_LOG ("objects_start:%p", comp->priv->objects_start);
+  GST_LOG ("objects_start:%p objects_stop:%p", comp->priv->objects_start,
+      comp->priv->objects_stop);
 
-  for (; tmp; tmp = g_list_next (tmp)) {
-    GnlObject *object = (GnlObject *) tmp->data;
+  if (reverse) {
+    for (tmp = comp->priv->objects_stop; tmp; tmp = g_list_next (tmp)) {
+      GnlObject *object = (GnlObject *) tmp->data;
 
-    GST_LOG_OBJECT (object,
-        "start: %" GST_TIME_FORMAT " , stop:%" GST_TIME_FORMAT " , duration:%"
-        GST_TIME_FORMAT ", priority:%u", GST_TIME_ARGS (object->start),
-        GST_TIME_ARGS (object->stop), GST_TIME_ARGS (object->duration),
-        object->priority);
+      GST_LOG_OBJECT (object,
+          "start: %" GST_TIME_FORMAT ", stop:%" GST_TIME_FORMAT " , duration:%"
+          GST_TIME_FORMAT ", priority:%u, active:%d",
+          GST_TIME_ARGS (object->start), GST_TIME_ARGS (object->stop),
+          GST_TIME_ARGS (object->duration), object->priority, object->active);
 
-    if (object->start <= timestamp) {
-      if ((object->stop > timestamp) &&
-          (object->priority >= priority) &&
-          ((!activeonly) || (object->active))) {
-        GST_LOG_OBJECT (comp, "adding %s: sorted to the stack",
-            GST_OBJECT_NAME (object));
-        stack = g_list_insert_sorted (stack, object,
-            (GCompareFunc) priority_comp);
+      if (object->stop >= timestamp) {
+        if ((object->start < timestamp) &&
+            (object->priority >= priority) &&
+            ((!activeonly) || (object->active))) {
+          GST_LOG_OBJECT (comp, "adding %s: sorted to the stack",
+              GST_OBJECT_NAME (object));
+          stack = g_list_insert_sorted (stack, object,
+              (GCompareFunc) priority_comp);
+        }
+      } else {
+        GST_LOG_OBJECT (comp, "too far, stopping iteration");
+        first_out_of_stack = object->stop;
+        break;
       }
-    } else {
-      GST_LOG_OBJECT (comp, "too far, stopping iteration");
-      first_out_of_stack = object->start;
-      break;
+    }
+  } else {
+    for (tmp = comp->priv->objects_start; tmp; tmp = g_list_next (tmp)) {
+      GnlObject *object = (GnlObject *) tmp->data;
+
+      GST_LOG_OBJECT (object,
+          "start: %" GST_TIME_FORMAT " , stop:%" GST_TIME_FORMAT " , duration:%"
+          GST_TIME_FORMAT ", priority:%u", GST_TIME_ARGS (object->start),
+          GST_TIME_ARGS (object->stop), GST_TIME_ARGS (object->duration),
+          object->priority);
+
+      if (object->start <= timestamp) {
+        if ((object->stop > timestamp) &&
+            (object->priority >= priority) &&
+            ((!activeonly) || (object->active))) {
+          GST_LOG_OBJECT (comp, "adding %s: sorted to the stack",
+              GST_OBJECT_NAME (object));
+          stack = g_list_insert_sorted (stack, object,
+              (GCompareFunc) priority_comp);
+        }
+      } else {
+        GST_LOG_OBJECT (comp, "too far, stopping iteration");
+        first_out_of_stack = object->start;
+        break;
+      }
     }
   }
 
@@ -1388,9 +1440,12 @@ get_stack_list (GnlComposition * comp, GstClockTime timestamp,
   /* convert that list to a stack */
   tmp = stack;
   ret = convert_list_to_tree (&tmp, &nstart, &nstop, &highest);
-  if (GST_CLOCK_TIME_IS_VALID (first_out_of_stack)
-      && nstop > first_out_of_stack)
-    nstop = first_out_of_stack;
+  if (GST_CLOCK_TIME_IS_VALID (first_out_of_stack)) {
+    if (reverse && nstart < first_out_of_stack)
+      nstart = first_out_of_stack;
+    else if (!reverse && nstop > first_out_of_stack)
+      nstop = first_out_of_stack;
+  }
 
   GST_DEBUG ("nstart:%" GST_TIME_FORMAT ", nstop:%" GST_TIME_FORMAT,
       GST_TIME_ARGS (nstart), GST_TIME_ARGS (nstop));
@@ -1426,6 +1481,7 @@ get_clean_toplevel_stack (GnlComposition * comp, GstClockTime * timestamp,
   GstClockTime start = G_MAXUINT64;
   GstClockTime stop = G_MAXUINT64;
   guint highprio;
+  gboolean reverse = (comp->priv->segment->rate < 0.0);
 
   GST_DEBUG_OBJECT (comp, "timestamp:%" GST_TIME_FORMAT,
       GST_TIME_ARGS (*timestamp));
@@ -1442,20 +1498,32 @@ get_clean_toplevel_stack (GnlComposition * comp, GstClockTime * timestamp,
 
     GST_DEBUG_OBJECT (comp,
         "Got empty stack, checking if it really was after the last object");
-    /* Find the first active object just after *timestamp */
-    for (tmp = comp->priv->objects_start; tmp; tmp = g_list_next (tmp)) {
-      object = (GnlObject *) tmp->data;
+    if (reverse) {
+      /* Find the first active object just before *timestamp */
+      for (tmp = comp->priv->objects_stop; tmp; tmp = g_list_next (tmp)) {
+        object = (GnlObject *) tmp->data;
 
-      if ((object->start > *timestamp) && object->active)
-        break;
+        if (object->stop < *timestamp && object->active)
+          break;
+      }
+    } else {
+      /* Find the first active object just after *timestamp */
+      for (tmp = comp->priv->objects_start; tmp; tmp = g_list_next (tmp)) {
+        object = (GnlObject *) tmp->data;
+
+        if (object->start > *timestamp && object->active)
+          break;
+      }
     }
 
     if (tmp) {
       GST_DEBUG_OBJECT (comp,
-          "Found a valid object after %" GST_TIME_FORMAT " : %s [%"
-          GST_TIME_FORMAT "]", GST_TIME_ARGS (*timestamp),
-          GST_ELEMENT_NAME (object), GST_TIME_ARGS (object->start));
-      *timestamp = object->start;
+          "Found a valid object %s %" GST_TIME_FORMAT " : %s [%"
+          GST_TIME_FORMAT " - %" GST_TIME_FORMAT "]",
+          (reverse ? "before" : "after"), GST_TIME_ARGS (*timestamp),
+          GST_ELEMENT_NAME (object), GST_TIME_ARGS (object->start),
+          GST_TIME_ARGS (object->stop));
+      *timestamp = (reverse ? object->stop : object->start);
       stack =
           get_stack_list (comp, *timestamp, 0, TRUE, &start, &stop, &highprio);
     }
@@ -1832,7 +1900,9 @@ no_more_pads_object_cb (GstElement * element, GnlComposition * comp)
       /* 2. send pending seek */
       if (comp->priv->childseek) {
         GstEvent *childseek = comp->priv->childseek;
+
         comp->priv->childseek = NULL;
+
         GST_INFO_OBJECT (comp, "Sending pending seek on %s:%s",
             GST_DEBUG_PAD_NAME (tpad));
         COMP_OBJECTS_UNLOCK (comp);
@@ -2325,13 +2395,23 @@ update_pipeline (GnlComposition * comp, GstClockTime currenttime,
     if (!samestack)
       todeactivate = compare_relink_stack (comp, stack, modify);
 
-    startchanged = comp->priv->segment_start != currenttime;
-    stopchanged = comp->priv->segment_stop != new_stop;
+    if (comp->priv->segment->rate >= 0.0) {
+      startchanged = comp->priv->segment_start != currenttime;
+      stopchanged = comp->priv->segment_stop != new_stop;
+    } else {
+      startchanged = comp->priv->segment_start != new_start;
+      stopchanged = comp->priv->segment_stop != currenttime;
+    }
 
     /* 3. set new segment_start/stop (the current zone over which the new stack
      *    is valid) */
-    comp->priv->segment_start = currenttime;
-    comp->priv->segment_stop = new_stop;
+    if (comp->priv->segment->rate >= 0.0) {
+      comp->priv->segment_start = currenttime;
+      comp->priv->segment_stop = new_stop;
+    } else {
+      comp->priv->segment_start = new_start;
+      comp->priv->segment_stop = currenttime;
+    }
 
     /* 4. Clear pending child seek
      *    We'll be creating a new one */
@@ -2413,7 +2493,6 @@ update_pipeline (GnlComposition * comp, GstClockTime currenttime,
 
         /* Get toplevel object source pad */
         if ((pad = get_src_pad (GST_ELEMENT (comp->priv->current->data)))) {
-
           GST_DEBUG_OBJECT (comp, "We have a valid toplevel element pad %s:%s",
               GST_DEBUG_PAD_NAME (pad));
 
